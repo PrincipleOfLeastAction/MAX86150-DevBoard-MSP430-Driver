@@ -1,0 +1,33 @@
+/*
+ * I2CDriver.c
+ *
+ *  Created on: 26 Nov. 2021
+ *      Author: Steven Poon
+ */
+
+
+/////////////////////// General I2C stuff below //////////////////////////
+void I2C_Master_Init() {
+    // Set GPIO function
+    I2C_PIN_PORT_ALT_FUNCTION_REG |= SDA_PIN_BIT + SCL_PIN_BIT;
+
+    // USCI reset.
+    CONTROL_REG_1 |= RESET_BIT;
+    // Initialise Universal Serial Communication Interface with master mode (UCMST),
+    // I2C mode (UCMODE_3) and synchronous mode (UCSYNC). See p.1016 MSPx5xx family
+    // user guide and p.1004.
+    CONTROL_REG_0 = MASTER_BIT + I2C_MODE_BIT + SYNCHRONOUS_MODE_BIT;
+
+    // Setting clock speeds
+    CONTROL_REG_1 = SMCLK_CLOCK_SOURCE_BIT + RESET_BIT;
+    BIT_RATE_CONTROL_REG_0 = 40;
+    BIT_RATE_CONTROL_REG_1 = 0;
+
+    // Clear the reset.
+    CONTROL_REG_1 &= ~RESET_BIT;
+
+    // Turn NACK interrupt on for when we send slave address to catch
+    // any NACK.
+    USCI_INTERRUPT_ENABLE_REG |= NOT_ACK_INTERRUPT_ENABLE;
+
+}

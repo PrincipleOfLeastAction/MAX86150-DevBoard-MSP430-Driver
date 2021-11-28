@@ -1,0 +1,323 @@
+/*
+ * This program initialises the MPU6050 and requests the data for
+ * acceleration in the x-direction. It stores it in an array and then
+ * goes into sleep mode.
+ * Author: Steven Poon
+ *
+ * Wiring:
+ *      MPU6050 ------ MSP430F5529 LAUNCHPAD
+ *      - VCC   ------ 3.3V
+ *      - GND   ------ GND
+ *      - SCL   ------ P4.2
+ *      - SDA   ------ P4.1
+ ************************* TO DO ************************
+ * - Implement continuous logging into flash space.
+ * - Implement SD card logging interface via SPI.
+ * -
+ */
+
+#include <msp430.h>
+#include <stdint.h>
+#include "I2CDriver.h"
+
+// MPU6050 Specific
+#define SLAVE_ADDR                      0x68
+#define PWR_MGMT_1                      0x6B
+#define POWER_MANAGEMENT_REG            PWR_MGMT_1
+#define SLEEP_OFF                       0x0
+#define ACCEL_CONFIG                    0x1C
+#define ACCEL_SETTING                   0x00
+#define ACCEL_XOUT_H                    0x3B
+#define ACCEL_ZOUT_H                    0x3F
+
+#define TRANSMIT_BUFFER                 2
+#define RECEIVED_BUFFER                 8
+
+// Better register defines to improve readability.
+#define SDA_PIN_BIT                     BIT1
+#define SCL_PIN_BIT                     BIT2
+#define I2C_PIN_PORT_ALT_FUNCTION_REG   P4SEL
+#define CONTROL_REG_0                   UCB1CTL0
+#define CONTROL_REG_1                   UCB1CTL1
+#define RESET_BIT                       UCSWRST
+#define MASTER_BIT                      UCMST
+#define I2C_MODE_BIT                    UCMODE_3
+#define SYNCHRONOUS_MODE_BIT            UCSYNC
+#define SMCLK_CLOCK_SOURCE_BIT          UCSSEL__SMCLK
+#define MASTER_TRANSMIT_MODE_BIT        UCTR
+#define START_CONDITION_BIT             UCTXSTT
+#define STOP_CONDITION_BIT              UCTXSTP
+#define BIT_RATE_CONTROL_REG_0          UCB1BR0
+#define BIT_RATE_CONTROL_REG_1          UCB1BR1
+#define USCI_INTERRUPT_ENABLE_REG       UCB1IE
+#define NOT_ACK_INTERRUPT_ENABLE        UCNACKIE
+#define TX_INTERRUPT_ENABLE             UCTXIE
+#define RX_INTERRUPT_ENABLE             UCRXIE
+#define SLAVE_ADDR_REG                  UCB1I2CSA
+#define TRANSMIT_BUFFER_REG             UCB1TXBUF
+#define RECEIVE_BUFFER_REG              UCB1RXBUF
+
+// Unified Clock Registers
+#define UNIFIED_CLOCK_SYSTEM_REG_4      UCSCTL4
+#define SMCLK_CLOCK_SOURCE_XT2CLK       SELS__XT2CLK
+#define UNIFIED_CLOCK_SYSTEM_REG_6      UCSCTL6
+#define XT2_PIN_PORT                    P5SEL
+#define XT2IN                           BIT2
+#define XT2OUT                          BIT3
+#define XT2DRIVE_HIGH                   XT1DRIVE0 + XT1DRIVE1
+
+// Prototypes
+void slaveInit(void);
+void programInit(void);
+void I2C_Init(void);
+void masterWriteReg(uint8_t slaveAddr, uint8_t regAddr, uint8_t writeData, uint8_t dataCount);
+void masterReadReg(uint8_t slaveAddr, uint8_t regAddr, uint8_t numReads);
+__interrupt void USCI_B1_ISR(void);
+
+typedef enum I2C_State_enum {
+    IDLE = 0,
+    TRANSMITTING = 2,
+    RECEIVE_SEND_REG = 4,
+    RESTART = 6,
+    READING_DATA = 8,
+    STOPPING = 10
+} I2C_State;
+
+// Set initial state of our program.
+I2C_State state = IDLE;
+
+// Some global variable to assist
+// Holds the data that is to be transmitted.
+uint8_t dataToTransmitBuffer[TRANSMIT_BUFFER];
+int16_t receivedBuffer[RECEIVED_BUFFER];
+int8_t tempData;
+int16_t currentData;
+uint8_t longBit = 1;
+uint8_t transmitIndex = 0;
+uint8_t numReceiveRemaining;
+uint8_t receivedBufferIndex = 0;
+//uint8_t numTransmitted = 0;
+
+
+void main(void) {
+
+    WDTCTL = WDTPW | WDTHOLD; // Stop the watchdog timer.
+    // Initialise Global interrupt
+    programInit();
+    // Initalise I2C bus.
+    I2C_Init();
+    // Turn MPU6050 on
+    slaveInit();
+//    while (state != IDLE) {
+//        __no_operation();
+//    }
+    while (1) {
+        masterReadReg(SLAVE_ADDR, ACCEL_ZOUT_H, 2);
+    }
+}
+
+// Code specific to MPU6050
+void slaveInit() {
+    masterWriteReg(SLAVE_ADDR, POWER_MANAGEMENT_REG, SLEEP_OFF, 1);
+//    while (state != IDLE) {
+//        __no_operation();
+//    }
+    masterWriteReg(SLAVE_ADDR, ACCEL_CONFIG, ACCEL_SETTING, 1);
+}
+
+
+void programInit() {
+    __enable_interrupt();
+    // Low power initialisation.
+    PADIR = 0x0;
+    PAOUT = 0x0;
+    PBDIR = 0x0;
+    PBOUT = 0x0;
+    PCDIR = 0x0;
+    PCOUT = 0x0;
+    PDDIR = 0x0;
+    PDOUT = 0x0;
+
+    // XT2 Clock init
+    // Set port 5.2 and 5.1 to alternate mode
+    XT2_PIN_PORT |= XT2IN + XT2OUT;
+    UNIFIED_CLOCK_SYSTEM_REG_4 |= SMCLK_CLOCK_SOURCE_XT2CLK;
+    // Turns XT2 drive to low and XT2 on.
+    UNIFIED_CLOCK_SYSTEM_REG_6 &= ~(XT2DRIVE_HIGH + XT2OFF);
+}
+
+/////////////////////// General I2C stuff below //////////////////////////
+void I2C_Init() {
+    // Set GPIO function
+    I2C_PIN_PORT_ALT_FUNCTION_REG |= SDA_PIN_BIT + SCL_PIN_BIT;
+
+    // USCI reset.
+    CONTROL_REG_1 |= RESET_BIT;
+    // Initialise Universal Serial Communication Interface with master mode (UCMST),
+    // I2C mode (UCMODE_3) and synchronous mode (UCSYNC). See p.1016 MSPx5xx family
+    // user guide and p.1004.
+    CONTROL_REG_0 = MASTER_BIT + I2C_MODE_BIT + SYNCHRONOUS_MODE_BIT;
+
+    // Setting clock speeds
+    CONTROL_REG_1 = SMCLK_CLOCK_SOURCE_BIT + RESET_BIT;
+    BIT_RATE_CONTROL_REG_0 = 40;
+    BIT_RATE_CONTROL_REG_1 = 0;
+
+    // Clear the reset.
+    CONTROL_REG_1 &= ~RESET_BIT;
+
+    // Turn NACK interrupt on for when we send slave address to catch
+    // any NACK.
+    USCI_INTERRUPT_ENABLE_REG |= NOT_ACK_INTERRUPT_ENABLE;
+
+}
+
+// This function writes a certain message to a register on
+// the slave device. Used to configure certain settings on
+// said I2C sensor. ONLY WORKS WITH 7 BIT SLAVE ADDR.
+void masterWriteReg(uint8_t slaveAddr, uint8_t regAddr, uint8_t writeData, uint8_t dataCount) {
+    // Set current program state to TRANSMITTING;
+    state = dataCount ? TRANSMITTING : RECEIVE_SEND_REG;
+
+    // Update the global data transmit buffer.
+    // 0 Must be the register address
+    dataToTransmitBuffer[0] = regAddr;
+    if (dataCount) {
+        dataToTransmitBuffer[1] = writeData;
+    }
+    transmitIndex = 0;
+//    numTransmitted = 0;
+
+    // Write Slave address to register.
+    SLAVE_ADDR_REG = slaveAddr;
+    // Disable RX interrupt
+    USCI_INTERRUPT_ENABLE_REG &= ~RX_INTERRUPT_ENABLE;
+    // Enable TX interrupt
+    USCI_INTERRUPT_ENABLE_REG |= TX_INTERRUPT_ENABLE;
+    // Set master into transmit mode and generate start condition.
+    // This generates an interrupt
+    CONTROL_REG_1 |= MASTER_TRANSMIT_MODE_BIT + START_CONDITION_BIT;
+    __bis_SR_register(LPM0_bits + GIE);
+}
+
+void masterReadReg(uint8_t slaveAddr, uint8_t regAddr, uint8_t numReads) {
+    state = RECEIVE_SEND_REG;
+    numReceiveRemaining = numReads;
+    receivedBufferIndex = 0;
+    // Write the ACCEL_XOUT_T to the MPU6050 to start reading there.
+    masterWriteReg(slaveAddr, regAddr, 0, 0);
+
+    // First send start bit.
+    // Send slave addr + write
+    // send regAddr
+    // Send repeated start bit + read
+    // While numReads > 0
+    //      read the data.
+    // Send NACK + stop bit.
+}
+
+/* This function is where the interrupt magic happens.
+ * There is only 1 interrupt vector for transmit, receive and state
+ * changes.
+ */
+#pragma vector=USCI_B1_VECTOR
+__interrupt void USCI_B1_ISR(void) {
+
+    // __even_in_range returns UCB1IV where UCB1IV is even number between
+    // 0 and 0x0C. __even_in_range is used to tell the compiler to optimise
+    // the code further as the register cannot be an odd number.
+    switch(__even_in_range(UCB1IV, 0x0C)) {
+    /* A few cases were not included as they cannot be generated under
+     * master mode. These include
+     *      - No interrupt (USCI_NONE)
+     *      - Arbitration lost (USCI_I2C_UCALIFG)
+     *          - Triggered when another master try to speak at the same
+     *              time.
+     *      - Received Start signal (USCI_I2C_UCSTTIFG) (We're master mode)
+     *      - Received Stop signal (USCI_I2C_UCSTPIFG) (We're master.)
+     * For more information, see P.1013 of MSP430x5xx Family User Guide
+     */
+        // Not acknowledgment
+        case USCI_I2C_UCNACKIFG:
+            // Best practice is to send the message again and retry.
+            // Or master should generate a stop condition.
+            break;
+        // Data received
+        case USCI_I2C_UCRXIFG:
+            // Just got a data bit in buffer. Put it into another bigger
+            // buffer
+            if (numReceiveRemaining-- > 0) {
+//                receivedBuffer[receivedBufferIndex++] = RECEIVE_BUFFER_REG;
+                if (longBit) {
+                    tempData = RECEIVE_BUFFER_REG;
+                    longBit = 0;
+                } else {
+                    currentData = (tempData << 8) | RECEIVE_BUFFER_REG;
+                    receivedBuffer[receivedBufferIndex++] = currentData;
+                    longBit = 1;
+                }
+            }
+            // When there is only 1 item left to read, set the stop register.
+            if (numReceiveRemaining == 1) {
+                CONTROL_REG_1 |= STOP_CONDITION_BIT;
+            // No more items remaining to read.
+            // Signal that our last item has be done. Reset the variables and
+            // we can finish.
+            } else if (!numReceiveRemaining) {
+                // change state to IDLE.
+                state = IDLE;
+                // disable RX interrupt
+                USCI_INTERRUPT_ENABLE_REG &= ~RX_INTERRUPT_ENABLE;
+                // Exit low power mode.
+                __bic_SR_register_on_exit(LPM0_bits);
+            }
+            break;
+
+        // Transmit buffer empty interrupt.
+        case USCI_I2C_UCTXIFG:
+            switch(__even_in_range(state, 12)) {
+            // start condition is generated and we can then write data to
+            // the UCB1TXBUF register
+            case TRANSMITTING:
+                // If we haven't transmitted the 2 data send the data
+                // If we have transmitted the 2 data points, end the transaction.
+                TRANSMIT_BUFFER_REG = dataToTransmitBuffer[transmitIndex++];
+                // If there are more data to transmit, keep transmitting else
+                // send stop signal.
+                state = transmitIndex < 2 ? TRANSMITTING : STOPPING;
+                break;
+            // In this case, we just send the register address.
+            case RECEIVE_SEND_REG:
+                // Transmit the address to start reading at.
+                TRANSMIT_BUFFER_REG = dataToTransmitBuffer[transmitIndex];
+                state = RESTART;
+                break;
+            // Send restart signal on read mode. mode.
+            case RESTART:
+                // Turn on RX interrupt and turn off TX interrupt
+                USCI_INTERRUPT_ENABLE_REG |= RX_INTERRUPT_ENABLE;
+                USCI_INTERRUPT_ENABLE_REG &= ~TX_INTERRUPT_ENABLE;
+                // Turn transmit mode off. i.e Turn read mode on.
+                CONTROL_REG_1 &= ~MASTER_TRANSMIT_MODE_BIT;
+                // Generate start condition in read mode.
+                CONTROL_REG_1 |= START_CONDITION_BIT;
+                state = READING_DATA;
+                break;
+            case STOPPING:
+                // Sending STOP bit.
+                CONTROL_REG_1 |= STOP_CONDITION_BIT;
+                // Disable TX interrupt;
+                USCI_INTERRUPT_ENABLE_REG &= ~TX_INTERRUPT_ENABLE;
+                state = IDLE;
+                // Exit low power mode.
+                __bic_SR_register_on_exit(LPM0_bits);
+                break;
+            } // State case
+
+            break; // TXIGF case
+
+        default:
+            break;
+    }
+
+}
