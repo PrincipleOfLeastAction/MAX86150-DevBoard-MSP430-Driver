@@ -4,7 +4,7 @@ The MSP430 program for extracting data from the MAX86150 sensor and outputting i
 A beginner project for learning electronics.
 
 ### Wiring Connections
-
+<pre>
 Wiring Diagram
 MSP430   --------- MAX86150      Logic Analyser
 P4.1     --------- SDA
@@ -13,6 +13,7 @@ P2.7     --------- INT
 3.3V     --------- VCC
 GND      --------- GND
 P3.2 ----------------------------- Normal Pin (Interrupt Debug GPIO toggled)
+</pre>
 
 ### Brief process undertaken
 1. Find a sensor on Digikey.
